@@ -37,31 +37,51 @@ class RigCtl:
         self._lock = threading.Lock()
 
     def connect(self) -> None:
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((self.host, self.port))
-        logging.info(f"[RIG] Connected to {self.host}:{self.port}")
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5)
+            self.sock.connect((self.host, self.port))
+            self.sock.settimeout(None)
+            logging.info(f"[RIG] Connected to {self.host}:{self.port}")
+        except Exception as e:
+            self.sock = None
+            logging.warning(f"[RIG] Connection failed: {e}")
+            raise
+
+    def is_connected(self) -> bool:
+        return self.sock is not None
 
     def send_command(self, cmd: str) -> str:
         if not self.sock:
             raise RuntimeError("RIG socket not connected")
 
-        with self._lock:
-            self.sock.sendall((cmd + "\n").encode())
+        try:
+            with self._lock:
+                self.sock.sendall((cmd + "\n").encode())
 
-            data = b""
-            while True:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-                if b"\n" in chunk:
-                    break
+                data = b""
+                while True:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("RIG connection lost")
+                    data += chunk
+                    if b"\n" in chunk:
+                        break
 
-            return data.decode(errors="ignore").strip()
+                return data.decode(errors="ignore").strip()
+
+        except Exception as e:
+            logging.warning(f"[RIG] Connection lost: {e}")
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+            raise
 
     def set_frequency(self, freq: int) -> None:
-        #resp = self.send_command(f"F {freq}")
-        logging.info(f"[RIG] Set frequency to {freq} Hz ->  NIL")
+        resp = self.send_command(f"F {freq}")
+        logging.info(f"[RIG] Set frequency to {freq} Hz ->  {resp} ")
 
     def set_mode(self, mode: str) -> None:
         # Some rigs/rigctld expect FM instead of NFM etc — normalize before sending.
@@ -164,8 +184,16 @@ class SDRConnectClient:
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
 
     async def connect(self) -> None:
-        self.websocket = await websockets.connect(self.ws_url)
-        logging.info(f"[SDR] Connected to {self.ws_url}")
+        try:
+            self.websocket = await websockets.connect(self.ws_url)
+            logging.info(f"[SDR] Connected to {self.ws_url}")
+        except Exception as e:
+            self.websocket = None
+            logging.warning(f"[SDR] Connection failed: {e}")
+            raise
+
+    def is_connected(self) -> bool:
+        return self.websocket is not None
 
     # -------------------------------------------------
     # Internal helper
@@ -244,30 +272,36 @@ class SDRConnectClient:
     # -------------------------------------------------
     # Listener (unchanged)
     # -------------------------------------------------
-    async def listen(self, on_frequency_change, on_mode_change, on_audio_mute_change) -> None:
-        """Listen for property changes from SDRconnect"""
-        if not self.websocket:
-            return
+    async def listen(self, on_frequency_change, on_mode_change, on_audio_mute_change):
+        while True:
+            if not self.websocket:
+                await asyncio.sleep(1)
+                continue
 
-        async for message in self.websocket:
             try:
-                data = json.loads(message)
-                prop = data.get("property")
-                event_type = data.get("event_type")
-                value = data.get("value")
+                async for message in self.websocket:
+                    try:
+                        data = json.loads(message)
+                        prop = data.get("property")
+                        event_type = data.get("event_type")
+                        value = data.get("value")
 
-                if event_type != "property_changed" or value is None:
-                    continue
+                        if event_type != "property_changed" or value is None:
+                            continue
 
-                if prop == FREQ_PROP:
-                    await on_frequency_change(value)
-                elif prop == MODE_PROP:
-                    await on_mode_change(value)
-                elif prop == AUDIO_MUTE_PROP:
-                    await on_audio_mute_change(value)
+                        if prop == FREQ_PROP:
+                            await on_frequency_change(value)
+                        elif prop == MODE_PROP:
+                            await on_mode_change(value)
+                        elif prop == AUDIO_MUTE_PROP:
+                            await on_audio_mute_change(value)
 
+                    except Exception as e:
+                        logging.warning(f"[SDR] Failed to parse message: {e}")
             except Exception as e:
-                logging.warning(f"[SDR] Failed to parse message: {e}")
+                logging.warning(f"[SDR] Listener error: {e}")
+                self.websocket = None
+                await asyncio.sleep(2)
 
 
 # ================= WAVELOG =================
@@ -345,12 +379,11 @@ class CATBridge:
         self._tuning = False
 
     async def start(self):
-        self.rig.connect()
-        await self.sdr.connect()
-
         await asyncio.gather(
+            self.rig_connection_manager(),
+            self.sdr_connection_manager(),
             self.monitor_tx(),
-            self.monitor_rig_state(),   # <-- NEW
+            self.monitor_rig_state(),
             self.keyboard_listener(),
             self.sdr.listen(
                 on_frequency_change=self.on_frequency_change,
@@ -359,6 +392,28 @@ class CATBridge:
             ),
             self.wave.start()
         )
+
+    async def rig_connection_manager(self):
+        while True:
+            if not self.rig.is_connected():
+                try:
+                    logging.info("[RIG] Attempting reconnect...")
+                    await asyncio.to_thread(self.rig.connect)
+                except Exception:
+                    await asyncio.sleep(3)
+                    continue
+            await asyncio.sleep(2)
+
+    async def sdr_connection_manager(self):
+        while True:
+            if not self.sdr.is_connected():
+                try:
+                    logging.info("[SDR] Attempting reconnect...")
+                    await self.sdr.connect()
+                except Exception:
+                    await asyncio.sleep(3)
+                    continue
+            await asyncio.sleep(2)
 
     async def on_frequency_change(self, freq: int):
         self.current_frequency = freq
