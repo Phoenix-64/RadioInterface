@@ -1,10 +1,9 @@
-"""Entry point for CAT bridge."""
-
 import asyncio
 import logging
+import os
+import signal
 
 from .bridge import CATBridge
-
 
 def main() -> None:
     """Start the CAT bridge."""
@@ -16,8 +15,8 @@ def main() -> None:
     try:
         asyncio.run(bridge.start())
     except KeyboardInterrupt:
-        logging.info("Shutting down.")
-
+        logging.info("Shutting down forcefully.")
+        os._exit(0)  # Force immediate exit
 
 if __name__ == "__main__":
     main()

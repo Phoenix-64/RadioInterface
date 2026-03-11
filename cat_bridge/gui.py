@@ -12,6 +12,7 @@ class SMeterDisplay:
 
     def __init__(self) -> None:
         self._queue: queue.Queue = queue.Queue()
+        self._command_queue: queue.Queue = queue.Queue()  # for toggle commands
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._samples: List[Tuple[float, float]] = []  # (timestamp, dbm)
         self._avg_window = 0.7  # seconds
@@ -31,6 +32,10 @@ class SMeterDisplay:
     def update_power(self, dbm: float) -> None:
         """Queue a new power sample (called from any thread)."""
         self._queue.put((time.time(), dbm))
+
+    def toggle_visibility(self) -> None:
+        """Queue a command to show/hide the S‑meter window."""
+        self._command_queue.put(lambda: self._toggle())
 
     # ========== Conversion utilities ==========
 
@@ -63,6 +68,9 @@ class SMeterDisplay:
         self._root.overrideredirect(True)      # No title bar
         self._root.attributes("-topmost", True)
         self._root.resizable(False, False)
+
+        # Set initial position to X=0, Y=300
+        self._root.geometry("+0+300")
 
         # Make window draggable
         self._offset_x = 0
@@ -168,10 +176,27 @@ class SMeterDisplay:
         self._update_loop()
         self._root.mainloop()
 
+    def _toggle(self) -> None:
+        """Actually toggle visibility (runs in Tkinter thread)."""
+        if not self._root:
+            return
+        if self._root.state() == "normal":
+            self._root.withdraw()
+        else:
+            self._root.deiconify()
+
     def _update_loop(self) -> None:
-        """Periodically update meter from queued samples."""
+        """Periodically update meter from queued samples and process commands."""
+        # Process any pending commands
+        try:
+            while True:
+                cmd = self._command_queue.get_nowait()
+                cmd()
+        except queue.Empty:
+            pass
+
         now = time.time()
-        # Drain queue
+        # Drain power samples
         try:
             while True:
                 t, dbm = self._queue.get_nowait()

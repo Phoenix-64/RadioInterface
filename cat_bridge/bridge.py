@@ -184,8 +184,8 @@ class CATBridge:
     # ========== Console commands ==========
 
     async def _keyboard_listener(self) -> None:
-        """Listen for console commands: 'm', 'tune', 'ptt'."""
-        logging.info("[KEY] Commands: 'm' = toggle mute | 'tune' = carrier | 'ptt' = toggle CapsLock PTT")
+        """Listen for console commands: 'm', 'tune', 'ptt', 's'."""
+        logging.info("[KEY] Commands: 'm' = toggle mute | 'tune' = carrier | 'ptt' = toggle CapsLock PTT | 's' = toggle S‑meter")
 
         while True:
             try:
@@ -206,6 +206,10 @@ class CATBridge:
                 elif cmd == "ptt":
                     self.capslock_ptt_enabled = not self.capslock_ptt_enabled
                     logging.info(f"[PTT] CapsLock PTT {'ENABLED' if self.capslock_ptt_enabled else 'DISABLED'}")
+
+                elif cmd == "s":
+                    self.smeter.toggle_visibility()
+                    logging.info("[KEY] S‑meter toggled")
 
             except Exception as e:
                 logging.warning(f"[KEY] Keyboard listener error: {e}")
@@ -253,8 +257,7 @@ class CATBridge:
             self._ptt_pressed = True
             try:
                 if self.rig.is_connected():
-                    # Use asyncio.run_coroutine_threadsafe if needed,
-                    # but here we run the command synchronously in thread.
+                    # Use asyncio.run_coroutine_threadsafe to call async method
                     asyncio.run_coroutine_threadsafe(
                         self.rig.send_command("T 1"), asyncio.get_running_loop()
                     )
