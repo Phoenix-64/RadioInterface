@@ -5,7 +5,10 @@ import logging
 import socket
 import time
 import threading
+import keyboard
 from typing import Optional, Set
+import tkinter as tk
+import queue
 
 import websockets
 
@@ -15,11 +18,12 @@ RIG_HOST = "192.168.1.18"
 RIG_PORT = 4532
 WAVELOG_WS_PORT = 54322
 POLL_INTERVAL = 0.1  # seconds
-TUNE_DURATION = 6
+TUNE_DURATION = 5
 
 FREQ_PROP = "device_vfo_frequency"
 MODE_PROP = "demodulator"
 AUDIO_MUTE_PROP = "audio_mute"
+SIGNAL_POWER_PROP = "signal_power"
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -87,6 +91,10 @@ class RigCtl:
         # Some rigs/rigctld expect FM instead of NFM etc — normalize before sending.
         if mode == "NFM":
             mode = "FM"
+        elif mode == "LSB":
+            mode = "PKTLSB"
+        elif mode == "USB":
+            mode = "PKTUSB"
         resp = self.send_command(f"M {mode} 0")
         logging.info(f"[RIG] Set mode to {mode} -> {resp}")
 
@@ -272,7 +280,7 @@ class SDRConnectClient:
     # -------------------------------------------------
     # Listener (unchanged)
     # -------------------------------------------------
-    async def listen(self, on_frequency_change, on_mode_change, on_audio_mute_change):
+    async def listen(self, on_frequency_change, on_mode_change, on_audio_mute_change, on_signal_power):
         while True:
             if not self.websocket:
                 await asyncio.sleep(1)
@@ -295,6 +303,8 @@ class SDRConnectClient:
                             await on_mode_change(value)
                         elif prop == AUDIO_MUTE_PROP:
                             await on_audio_mute_change(value)
+                        elif prop == SIGNAL_POWER_PROP:
+                            await on_signal_power(value)
 
                     except Exception as e:
                         logging.warning(f"[SDR] Failed to parse message: {e}")
@@ -303,6 +313,192 @@ class SDRConnectClient:
                 self.websocket = None
                 await asyncio.sleep(2)
 
+
+# ================= S-METER GUI =================
+
+# ================= S-METER GUI =================
+
+class SMeterDisplay:
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+        self.samples = []
+        self.avg_window = 0.7
+
+    def start(self):
+        self.thread.start()
+
+    def update_power(self, dbm: float):
+        self.queue.put((time.time(), dbm))
+
+    def dbm_to_s(self, dbm):
+        s = 9 + (dbm + 73) / 6
+        if s < 0:
+            s = 0
+        return s
+
+    def format_s(self, s):
+        if s <= 9:
+            return f"S{int(round(s))}"
+        over = (s - 9) * 6
+        return f"S9+{int(over)}"
+
+    def dbm_to_meter(self, dbm):
+        if dbm < -121:
+            dbm = -121
+        if dbm > -33:
+            dbm = -33
+        return (dbm + 121) / 88
+
+    def _run(self):
+        root = tk.Tk()
+
+        # Remove title bar / window decorations
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+
+        # make window draggable
+        self._offset_x = 0
+        self._offset_y = 0
+
+        def start_move(event):
+            self._offset_x = event.x
+            self._offset_y = event.y
+
+        def do_move(event):
+            x = root.winfo_pointerx() - self._offset_x
+            y = root.winfo_pointery() - self._offset_y
+            root.geometry(f"+{x}+{y}")
+
+        root.bind("<Button-1>", start_move)
+        root.bind("<B1-Motion>", do_move)
+
+
+        # Dark theme colors
+        bg_main = "#2b2b2b"
+        bg_meter = "#3a3a3a"
+        text_color = "#d0d0d0"
+        tick_color = "#9a9a9a"
+        bar_color = "#4CAF50"
+
+        root.configure(bg=bg_main)
+
+        width = 420
+        height = 20
+
+        self.canvas = tk.Canvas(
+            root,
+            width=width,
+            height=height,
+            bg=bg_meter,
+            highlightthickness=0
+        )
+        self.canvas.pack(padx=8, pady=6)
+
+        self.bar = self.canvas.create_rectangle(
+            0, 0, 0, height,
+            fill=bar_color,
+            width=0
+        )
+
+        # scale positions
+        scale_dbm = [
+            -121,-115,-109,-103,-97,-91,-85,-79,-73,
+            -67,-61,-55,-49,-43,-37,-33
+        ]
+
+        for dbm in scale_dbm:
+            x = self.dbm_to_meter(dbm) * width
+            self.canvas.create_line(
+                x,
+                10,
+                x,
+                height,
+                fill=tick_color
+            )
+
+        labels = [
+            "S1","S2","S3","S4","S5","S6","S7","S8","S9",
+            "+10","+20","+30","+40","+50","+60"
+        ]
+
+        for i,label in enumerate(labels):
+            dbm = scale_dbm[i+1]
+            x = self.dbm_to_meter(dbm) * width
+            self.canvas.create_text(
+                x,
+                6,
+                text=label,
+                fill=text_color,
+                font=("Segoe UI",8)
+            )
+
+        info = tk.Frame(root, bg=bg_main)
+        info.pack(pady=(2,6))
+
+        self.dbm_label = tk.Label(
+            info,
+            text="-120 dBm",
+            font=("Segoe UI",11),
+            fg=text_color,
+            bg=bg_main
+        )
+        self.dbm_label.pack(side="left", padx=12)
+
+        self.s_inst_label = tk.Label(
+            info,
+            text="S0",
+            font=("Segoe UI",11),
+            fg=text_color,
+            bg=bg_main
+        )
+        self.s_inst_label.pack(side="left", padx=12)
+
+        self.s_avg_label = tk.Label(
+            info,
+            text="S0 avg",
+            font=("Segoe UI",11),
+            fg=text_color,
+            bg=bg_main
+        )
+        self.s_avg_label.pack(side="left", padx=12)
+
+        self._update_loop(root)
+        root.mainloop()
+
+    def _update_loop(self, root):
+        now = time.time()
+        try:
+            while True:
+                t, dbm = self.queue.get_nowait()
+                self.samples.append((t, dbm))
+        except queue.Empty:
+            pass
+
+        self.samples = [
+            (t,v) for (t,v) in self.samples
+            if now - t < self.avg_window
+        ]
+
+        if self.samples:
+            inst_dbm = self.samples[-1][1]
+            avg_dbm = sum(v for (_,v) in self.samples) / len(self.samples)
+
+            s_inst = self.dbm_to_s(inst_dbm)
+            s_avg = self.dbm_to_s(avg_dbm)
+
+            self.dbm_label.config(text=f"{inst_dbm:.1f} dBm")
+            self.s_inst_label.config(text=self.format_s(s_inst))
+            self.s_avg_label.config(text=f"{self.format_s(s_avg)} avg")
+
+            meter = self.dbm_to_meter(inst_dbm)
+            width = int(meter * 420)
+            self.canvas.coords(self.bar, 0, 0, width, 20)
+
+        root.after(40, lambda: self._update_loop(root))
 
 # ================= WAVELOG =================
 class WaveLogServer:
@@ -378,7 +574,19 @@ class CATBridge:
         self.tune_duration = TUNE_DURATION
         self._tuning = False
 
+        self.capslock_ptt_enabled = False
+
+        self.smeter = SMeterDisplay()
+
     async def start(self):
+
+        self.smeter.start()
+
+        threading.Thread(
+            target=self.start_capslock_ptt,
+            daemon=True
+        ).start()
+
         await asyncio.gather(
             self.rig_connection_manager(),
             self.sdr_connection_manager(),
@@ -388,9 +596,11 @@ class CATBridge:
             self.sdr.listen(
                 on_frequency_change=self.on_frequency_change,
                 on_mode_change=self.on_mode_change,
-                on_audio_mute_change=self.on_audio_mute_change
+                on_audio_mute_change=self.on_audio_mute_change,
+                on_signal_power=self.on_signal_power
             ),
             self.wave.start()
+
         )
 
     async def rig_connection_manager(self):
@@ -519,8 +729,10 @@ class CATBridge:
         Console commands:
           m      -> toggle automatic muting
           tune   -> transmit FM carrier for tune_duration seconds
+          ptt    -> toggle CapsLock PTT
         """
-        logging.info("[KEY] Commands: 'm' = toggle mute | 'tune' = carrier")
+
+        logging.info("[KEY] Commands: 'm' = toggle mute | 'tune' = carrier | 'ptt' = toggle CapsLock PTT")
 
         while True:
             try:
@@ -544,6 +756,17 @@ class CATBridge:
                 # --------------------
                 elif cmd == "tune":
                     asyncio.create_task(self.tune())
+
+                # --------------------
+                # Toggle CapsLock PTT
+                # --------------------
+                elif cmd == "ptt":
+                    self.capslock_ptt_enabled = not self.capslock_ptt_enabled
+
+                    if self.capslock_ptt_enabled:
+                        logging.info("[PTT] CapsLock PTT ENABLED")
+                    else:
+                        logging.info("[PTT] CapsLock PTT DISABLED")
 
             except Exception as e:
                 logging.warning(f"[KEY] Keyboard listener error: {e}")
@@ -594,6 +817,58 @@ class CATBridge:
 
         finally:
             self._tuning = False
+
+    def start_capslock_ptt(self):
+
+        logging.info("[PTT] CapsLock PTT listener started (disabled by default)")
+
+        self._ptt_pressed = False
+
+        def ptt_down(e):
+
+            if not self.capslock_ptt_enabled:
+                return
+
+            if self._ptt_pressed:
+                return
+
+            self._ptt_pressed = True
+
+            try:
+                if self.rig.is_connected():
+                    self.rig.send_command("T 1")
+                    logging.info("[PTT] TX ON")
+            except Exception as err:
+                logging.warning(f"[PTT] TX start failed: {err}")
+
+        def ptt_up(e):
+
+            if not self.capslock_ptt_enabled:
+                return
+
+            if not self._ptt_pressed:
+                return
+
+            self._ptt_pressed = False
+
+            try:
+                if self.rig.is_connected():
+                    self.rig.send_command("T 0")
+                    logging.info("[PTT] TX OFF")
+            except Exception as err:
+                logging.warning(f"[PTT] TX stop failed: {err}")
+
+        keyboard.on_press_key("caps lock", ptt_down, suppress=True)
+        keyboard.on_release_key("caps lock", ptt_up, suppress=True)
+
+    async def on_signal_power(self, value):
+
+        try:
+            dbm = float(value)
+        except:
+            return
+
+        self.smeter.update_power(dbm)
 
 
 # ================= ENTRY POINT =================

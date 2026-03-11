@@ -9,12 +9,17 @@ async def listen():
     try:
         async with websockets.connect(uri) as websocket:
             print(f"Connected to {uri}")
+            msg = json.dumps({
+                "event_type": "iq_stream_enable",
+                "value": "true"
+            })
+            await websocket.send(msg)
             while True:
                 message = await websocket.recv()
-                data = json.loads(message)
-                event_type = data.get("event_type")
-                prop = data.get("property")
-                value = data.get("value")
+                #data = json.loads(message)
+                # = data.get("event_type")
+                #prop = data.get("property")
+                #value = data.get("value")
                 print(f"Received: {message}")
                 #if event_type == "property_changed" and prop == FREQ_PROP:
                     #print(f'Frequency changed: {value}')
