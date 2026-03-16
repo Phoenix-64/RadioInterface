@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+import time
 from typing import Optional
 
 import keyboard
@@ -14,6 +15,9 @@ from .gui import SMeterDisplay
 from .wavelog import WaveLogServer
 
 
+SYNC_SUPPRESS = 0.35  # seconds
+
+
 class CATBridge:
     """Orchestrates communication between rigctld, SDRConnect, and WaveLog."""
 
@@ -23,13 +27,17 @@ class CATBridge:
         self.wave = WaveLogServer(settings.WAVELOG_WS_PORT)
         self.smeter = SMeterDisplay()
 
-        # Current known state
+        # Current known state (authoritative bridge state)
         self.current_frequency: Optional[int] = None
         self.current_mode: Optional[str] = None
 
-        # Last values from rig (to detect changes)
+        # Last values from rig (polling comparison)
         self._last_rig_frequency: Optional[int] = None
         self._last_rig_mode: Optional[str] = None
+
+        # Sync control
+        self._last_sync_source: Optional[str] = None
+        self._last_sync_time: float = 0.0
 
         # Mute state
         self.auto_muted = False
@@ -45,11 +53,13 @@ class CATBridge:
         self.capslock_ptt_enabled = False
         self._ptt_pressed = False
 
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
     async def start(self) -> None:
         """Start all background tasks."""
+        self._loop = asyncio.get_running_loop()
         self.smeter.start()
 
-        # Start CapsLock listener in a thread (blocking keyboard library)
         threading.Thread(target=self._capslock_ptt_listener, daemon=True).start()
 
         await asyncio.gather(
@@ -67,10 +77,25 @@ class CATBridge:
             self.wave.start()
         )
 
+    # ========== Sync Helpers ==========
+
+    def _sync_recent(self, source: str) -> bool:
+        """Check if a recent sync came from the opposite source."""
+        if self._last_sync_source is None:
+            return False
+
+        if self._last_sync_source == source:
+            return False
+
+        return (time.time() - self._last_sync_time) < SYNC_SUPPRESS
+
+    def _mark_sync(self, source: str) -> None:
+        self._last_sync_source = source
+        self._last_sync_time = time.time()
+
     # ========== Connection managers ==========
 
     async def _rig_connection_manager(self) -> None:
-        """Maintain rig connection."""
         while True:
             if not self.rig.is_connected():
                 try:
@@ -82,7 +107,6 @@ class CATBridge:
             await asyncio.sleep(2)
 
     async def _sdr_connection_manager(self) -> None:
-        """Maintain SDR connection."""
         while True:
             if not self.sdr.is_connected():
                 try:
@@ -93,43 +117,56 @@ class CATBridge:
                     continue
             await asyncio.sleep(2)
 
-    # ========== Event handlers from SDR ==========
+    # ========== SDR Event Handlers ==========
 
     async def _on_frequency_change(self, freq: int) -> None:
-        """SDR frequency changed -> update rig and WaveLog."""
+        if freq == self.current_frequency:
+            return
+
+        if self._sync_recent("sdr"):
+            return
+
+        logging.info(f"[SYNC] SDR -> RIG freq {freq}")
+
         self.current_frequency = freq
+        self._mark_sync("sdr")
+
         await self.rig.set_frequency(freq)
         await self.wave.broadcast_status(freq, self.current_mode or "")
 
     async def _on_mode_change(self, mode: str) -> None:
-        """SDR mode changed -> update rig and WaveLog."""
+        if mode == self.current_mode:
+            return
+
+        if self._sync_recent("sdr"):
+            return
+
+        logging.info(f"[SYNC] SDR -> RIG mode {mode}")
+
         self.current_mode = mode
+        self._mark_sync("sdr")
+
         await self.rig.set_mode(mode)
         await self.wave.broadcast_status(self.current_frequency or 0, mode)
 
     async def _on_audio_mute_change(self, value: str) -> None:
-        """SDR mute state changed (possibly by user)."""
         muted = (value == "true")
 
-        # Detect manual change (actual state differs from program intention)
         if muted != self.auto_muted:
             self.manual_override = True
-            self.auto_muted = False      # Give up automatic control
+            self.auto_muted = False
             logging.info(f"[SDR] Manual override detected: mute={muted}")
 
-        # Clear manual override if user unmutes during RX (normal listening)
         if self.manual_override and not muted and not self.tx:
             self.manual_override = False
-            logging.info("[SDR] Manual override cleared (user unmuted during RX)")
+            logging.info("[SDR] Manual override cleared")
 
     async def _on_signal_power(self, value: float) -> None:
-        """SDR signal power update -> refresh S-meter."""
         self.smeter.update_power(value)
 
-    # ========== Rig state monitoring ==========
+    # ========== Rig State Polling ==========
 
     async def _monitor_rig_state(self) -> None:
-        """Poll rig for frequency and mode changes, update SDR."""
         logging.info("[RIG] Rig state monitor started")
 
         while True:
@@ -137,55 +174,61 @@ class CATBridge:
                 freq = await self.rig.get_frequency()
                 mode = await self.rig.get_mode()
 
-                if freq is not None and freq != self._last_rig_frequency:
-                    logging.info(f"[RIG] Frequency changed -> {freq}")
-                    self._last_rig_frequency = freq
-                    self.current_frequency = freq
-                    await self.sdr.set_frequency(freq)
-                    await self.wave.broadcast_status(freq, self.current_mode or "")
+                if freq is not None and freq != self.current_frequency:
+                    if not self._sync_recent("rig"):
+                        logging.info(f"[SYNC] RIG -> SDR freq {freq}")
 
-                if mode and mode != self._last_rig_mode:
-                    logging.info(f"[RIG] Mode changed -> {mode}")
-                    self._last_rig_mode = mode
-                    self.current_mode = mode
-                    await self.sdr.set_mode(mode)
-                    await self.wave.broadcast_status(self.current_frequency or 0, mode)
+                        self.current_frequency = freq
+                        self._last_rig_frequency = freq
+                        self._mark_sync("rig")
+
+                        await self.sdr.set_frequency(freq)
+                        await self.wave.broadcast_status(freq, self.current_mode or "")
+
+                if mode and mode != self.current_mode:
+                    if not self._sync_recent("rig"):
+                        logging.info(f"[SYNC] RIG -> SDR mode {mode}")
+
+                        self.current_mode = mode
+                        self._last_rig_mode = mode
+                        self._mark_sync("rig")
+
+                        await self.sdr.set_mode(mode)
+                        await self.wave.broadcast_status(self.current_frequency or 0, mode)
 
             except Exception as e:
                 logging.warning(f"[RIG] Monitor error: {e}")
 
             await asyncio.sleep(settings.POLL_INTERVAL)
 
-    # ========== TX monitoring and muting ==========
+    # ========== TX Monitoring ==========
 
     async def _monitor_tx(self) -> None:
-        """Poll TX status and control SDR mute accordingly."""
         while True:
             tx_status = await self.rig.get_tx()
             tx = (tx_status == "1")
             self.tx = tx
 
             if tx != self.last_tx:
-                if tx:  # TX started
+                if tx:
                     if self.muting_enabled and not self.manual_override:
                         await self.sdr.set_audio_mute(True)
                         self.auto_muted = True
                         logging.info("[SDR] Program muted for TX")
-                else:   # TX ended
+                else:
                     if self.muting_enabled and self.auto_muted and not self.manual_override:
                         await self.sdr.set_audio_mute(False)
                         self.auto_muted = False
-                        logging.info("[SDR] Program unmuted after TX")
+                        logging.info("[SDR] Program unmuted")
 
                 self.last_tx = tx
 
             await asyncio.sleep(settings.POLL_INTERVAL)
 
-    # ========== Console commands ==========
+    # ========== Console Commands ==========
 
     async def _keyboard_listener(self) -> None:
-        """Listen for console commands: 'm', 'tune', 'ptt', 's'."""
-        logging.info("[KEY] Commands: 'm' = toggle mute | 'tune' = carrier | 'ptt' = toggle CapsLock PTT | 's' = toggle S‑meter")
+        logging.info("[KEY] Commands: m | tune | ptt | s")
 
         while True:
             try:
@@ -193,92 +236,78 @@ class CATBridge:
 
                 if cmd == "m":
                     self.muting_enabled = not self.muting_enabled
+
                     if not self.muting_enabled:
                         await self.sdr.set_audio_mute(False)
                         self.auto_muted = False
-                        logging.info("[KEY] Automatic muting DISABLED")
-                    else:
-                        logging.info("[KEY] Automatic muting ENABLED")
+
+                    logging.info(f"[KEY] Muting {'ENABLED' if self.muting_enabled else 'DISABLED'}")
 
                 elif cmd == "tune":
                     asyncio.create_task(self._tune())
 
                 elif cmd == "ptt":
                     self.capslock_ptt_enabled = not self.capslock_ptt_enabled
-                    logging.info(f"[PTT] CapsLock PTT {'ENABLED' if self.capslock_ptt_enabled else 'DISABLED'}")
+                    logging.info(f"[PTT] CapsLock {'ENABLED' if self.capslock_ptt_enabled else 'DISABLED'}")
 
                 elif cmd == "s":
                     self.smeter.toggle_visibility()
-                    logging.info("[KEY] S‑meter toggled")
 
             except Exception as e:
-                logging.warning(f"[KEY] Keyboard listener error: {e}")
+                logging.warning(f"[KEY] Error: {e}")
 
-    # ========== Tune function ==========
+    # ========== Tune Carrier ==========
 
     async def _tune(self) -> None:
-        """Transmit FM carrier for tune_duration seconds, then restore."""
         if self._tuning:
-            logging.info("[TUNE] Already tuning")
             return
 
         self._tuning = True
+
         try:
-            logging.info("[TUNE] Starting carrier")
             original_mode = self.current_mode or "FM"
             prev_muting = self.muting_enabled
             self.muting_enabled = False
 
             await self.rig.set_mode("FM")
-            await self.rig.send_command("T 1")   # TX on
+            await self.rig.send_command("T 1")
 
             await asyncio.sleep(settings.TUNE_DURATION)
 
-            await self.rig.send_command("T 0")   # TX off
+            await self.rig.send_command("T 0")
             await self.rig.set_mode(original_mode)
 
             self.muting_enabled = prev_muting
-            logging.info("[TUNE] Carrier finished")
 
-        except Exception as e:
-            logging.warning(f"[TUNE] Error: {e}")
         finally:
             self._tuning = False
 
-    # ========== CapsLock PTT (blocking keyboard thread) ==========
+    # ========== CapsLock PTT Thread ==========
 
     def _capslock_ptt_listener(self) -> None:
-        """Listen for CapsLock key presses in a background thread."""
-        logging.info("[PTT] CapsLock PTT listener started (disabled by default)")
+        logging.info("[PTT] CapsLock listener started")
 
-        def ptt_down(_) -> None:
+        def ptt_down(_):
             if not self.capslock_ptt_enabled or self._ptt_pressed:
                 return
-            self._ptt_pressed = True
-            try:
-                if self.rig.is_connected():
-                    # Use asyncio.run_coroutine_threadsafe to call async method
-                    asyncio.run_coroutine_threadsafe(
-                        self.rig.send_command("T 1"), asyncio.get_running_loop()
-                    )
-                    logging.info("[PTT] TX ON")
-            except Exception as err:
-                logging.warning(f"[PTT] TX start failed: {err}")
 
-        def ptt_up(_) -> None:
+            self._ptt_pressed = True
+
+            asyncio.run_coroutine_threadsafe(
+                self.rig.send_command("T 1"), self._loop
+            )
+
+        def ptt_up(_):
             if not self.capslock_ptt_enabled or not self._ptt_pressed:
                 return
+
             self._ptt_pressed = False
-            try:
-                if self.rig.is_connected():
-                    asyncio.run_coroutine_threadsafe(
-                        self.rig.send_command("T 0"), asyncio.get_running_loop()
-                    )
-                    logging.info("[PTT] TX OFF")
-            except Exception as err:
-                logging.warning(f"[PTT] TX stop failed: {err}")
+
+            asyncio.run_coroutine_threadsafe(
+                self.rig.send_command("T 0"), self._loop
+            )
 
         keyboard.on_press_key("caps lock", ptt_down, suppress=True)
         keyboard.on_release_key("caps lock", ptt_up, suppress=True)
-        # Keep thread alive
+
         threading.Event().wait()
