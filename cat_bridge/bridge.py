@@ -27,17 +27,20 @@ class CATBridge:
         self.wave = WaveLogServer(settings.WAVELOG_WS_PORT)
         self.smeter = SMeterDisplay()
 
-        # Current known state (authoritative bridge state)
+        # Current known state
         self.current_frequency: Optional[int] = None
         self.current_mode: Optional[str] = None
 
-        # Last values from rig (polling comparison)
+        # Last rig values (poll comparison)
         self._last_rig_frequency: Optional[int] = None
         self._last_rig_mode: Optional[str] = None
 
-        # Sync control
+        # Sync tracking
         self._last_sync_source: Optional[str] = None
         self._last_sync_time: float = 0.0
+
+        # Frequency follow mode
+        self.follow_frequency = True
 
         # Mute state
         self.auto_muted = False
@@ -53,7 +56,14 @@ class CATBridge:
         self.capslock_ptt_enabled = False
         self._ptt_pressed = False
 
+        # Event loop reference
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # SDR -> RIG frequency coalescing: latest value wins, intermediate steps dropped
+        self._pending_sdr_freq: Optional[int] = None
+        self._sdr_freq_event: asyncio.Event = asyncio.Event()
+
+
 
     async def start(self) -> None:
         """Start all background tasks."""
@@ -68,6 +78,7 @@ class CATBridge:
             self._monitor_tx(),
             self._monitor_rig_state(),
             self._keyboard_listener(),
+            self._sdr_freq_worker(),
             self.sdr.listen(
                 on_frequency_change=self._on_frequency_change,
                 on_mode_change=self._on_mode_change,
@@ -77,10 +88,10 @@ class CATBridge:
             self.wave.start()
         )
 
-    # ========== Sync Helpers ==========
+    # ================= Sync helpers =================
 
     def _sync_recent(self, source: str) -> bool:
-        """Check if a recent sync came from the opposite source."""
+        """Return True if a recent sync came from the opposite source."""
         if self._last_sync_source is None:
             return False
 
@@ -93,7 +104,7 @@ class CATBridge:
         self._last_sync_source = source
         self._last_sync_time = time.time()
 
-    # ========== Connection managers ==========
+    # ================= Connection managers =================
 
     async def _rig_connection_manager(self) -> None:
         while True:
@@ -117,24 +128,57 @@ class CATBridge:
                     continue
             await asyncio.sleep(2)
 
-    # ========== SDR Event Handlers ==========
+    # ================= SDR Event Handlers =================
 
     async def _on_frequency_change(self, freq: int) -> None:
+        """SDR frequency change event — coalesces rapid scroll steps."""
+
+        if not self.follow_frequency:
+            return
+
         if freq == self.current_frequency:
             return
 
         if self._sync_recent("sdr"):
             return
 
-        logging.info(f"[SYNC] SDR -> RIG freq {freq}")
-
+        # Update current_frequency immediately so duplicate events are dropped
+        # while the worker is busy. The worker will pick up the latest value.
         self.current_frequency = freq
-        self._mark_sync("sdr")
+        self._pending_sdr_freq = freq
+        self._sdr_freq_event.set()
 
-        await self.rig.set_frequency(freq)
-        await self.wave.broadcast_status(freq, self.current_mode or "")
+    async def _sdr_freq_worker(self) -> None:
+        """
+        Consume pending SDR frequency changes one at a time.
+
+        While the rig round-trip is in progress, any scroll steps that arrive
+        simply overwrite _pending_sdr_freq. When the rig finishes, we send
+        only the most recent value, skipping all intermediate steps.
+        """
+        while True:
+            await self._sdr_freq_event.wait()
+            self._sdr_freq_event.clear()
+
+            freq = self._pending_sdr_freq
+            if freq is None:
+                continue
+
+            self._pending_sdr_freq = None
+            self._mark_sync("sdr")
+
+            logging.info(f"[SYNC] SDR -> RIG freq {freq}")
+            await self.rig.set_frequency(freq)
+            await self.wave.broadcast_status(freq, self.current_mode or "")
+
+            # If more scroll events arrived while we were waiting for the rig,
+            # loop immediately instead of blocking on wait() again.
+            if self._pending_sdr_freq is not None:
+                self._sdr_freq_event.set()
 
     async def _on_mode_change(self, mode: str) -> None:
+        """SDR mode change event."""
+
         if mode == self.current_mode:
             return
 
@@ -164,7 +208,7 @@ class CATBridge:
     async def _on_signal_power(self, value: float) -> None:
         self.smeter.update_power(value)
 
-    # ========== Rig State Polling ==========
+    # ================= Rig polling =================
 
     async def _monitor_rig_state(self) -> None:
         logging.info("[RIG] Rig state monitor started")
@@ -174,19 +218,31 @@ class CATBridge:
                 freq = await self.rig.get_frequency()
                 mode = await self.rig.get_mode()
 
+                # Frequency handling
                 if freq is not None and freq != self.current_frequency:
-                    if not self._sync_recent("rig"):
-                        logging.info(f"[SYNC] RIG -> SDR freq {freq}")
 
+                    if not self.follow_frequency:
+                        # Track internally but do not push to SDR
                         self.current_frequency = freq
                         self._last_rig_frequency = freq
-                        self._mark_sync("rig")
 
-                        await self.sdr.set_frequency(freq)
-                        await self.wave.broadcast_status(freq, self.current_mode or "")
+                    else:
+                        if not self._sync_recent("rig"):
 
+                            logging.info(f"[SYNC] RIG -> SDR freq {freq}")
+
+                            self.current_frequency = freq
+                            self._last_rig_frequency = freq
+                            self._mark_sync("rig")
+
+                            await self.sdr.set_frequency(freq)
+                            await self.wave.broadcast_status(freq, self.current_mode or "")
+
+                # Mode handling
                 if mode and mode != self.current_mode:
+
                     if not self._sync_recent("rig"):
+
                         logging.info(f"[SYNC] RIG -> SDR mode {mode}")
 
                         self.current_mode = mode
@@ -201,7 +257,7 @@ class CATBridge:
 
             await asyncio.sleep(settings.POLL_INTERVAL)
 
-    # ========== TX Monitoring ==========
+    # ================= TX monitoring =================
 
     async def _monitor_tx(self) -> None:
         while True:
@@ -225,10 +281,10 @@ class CATBridge:
 
             await asyncio.sleep(settings.POLL_INTERVAL)
 
-    # ========== Console Commands ==========
+    # ================= Console commands =================
 
     async def _keyboard_listener(self) -> None:
-        logging.info("[KEY] Commands: m | tune | ptt | s")
+        logging.info("[KEY] Commands: m | tune | ptt | s | f (toggle freq follow)")
 
         while True:
             try:
@@ -253,10 +309,24 @@ class CATBridge:
                 elif cmd == "s":
                     self.smeter.toggle_visibility()
 
+                elif cmd == "f":
+                    self.follow_frequency = not self.follow_frequency
+
+                    if self.follow_frequency:
+                        logging.info("[SYNC] Frequency FOLLOW ENABLED")
+
+                        freq = await self.rig.get_frequency()
+                        if freq:
+                            self.current_frequency = freq
+                            await self.sdr.set_frequency(freq)
+
+                    else:
+                        logging.info("[SYNC] Frequency FOLLOW DISABLED (SDR free tuning)")
+
             except Exception as e:
                 logging.warning(f"[KEY] Error: {e}")
 
-    # ========== Tune Carrier ==========
+    # ================= Tune carrier =================
 
     async def _tune(self) -> None:
         if self._tuning:
@@ -282,7 +352,7 @@ class CATBridge:
         finally:
             self._tuning = False
 
-    # ========== CapsLock PTT Thread ==========
+    # ================= CapsLock PTT =================
 
     def _capslock_ptt_listener(self) -> None:
         logging.info("[PTT] CapsLock listener started")

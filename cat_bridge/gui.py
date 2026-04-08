@@ -69,6 +69,8 @@ class SMeterDisplay:
         self._root.attributes("-topmost", True)
         self._root.resizable(False, False)
 
+        self._root.withdraw()
+
         # Set initial position to X=0, Y=300
         self._root.geometry("+0+300")
 
