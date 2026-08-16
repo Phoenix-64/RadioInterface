@@ -17,6 +17,9 @@ class Settings:
     # WaveLog WebSocket server port
     WAVELOG_WS_PORT: int = 54322
 
+    # Wavelog cluster tune callback port (HTTP GET /{freq}/{mode})
+    WAVELOG_TUNE_PORT: int = 54321
+
     # Polling intervals
     POLL_INTERVAL: float = 0.1  # seconds
     TUNE_DURATION: int = 5       # seconds
