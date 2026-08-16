@@ -1,65 +1,51 @@
-"""WebSocket server for WaveLog browser client."""
+"""WaveLog REST API v2 client."""
 
-import asyncio
-import json
 import logging
-import time
-from typing import Set
+from typing import Optional
 
-import websockets
-from websockets import WebSocketServerProtocol
+import aiohttp
 
 
 class WaveLogServer:
-    """Simple WebSocket server that broadcasts radio status to browsers."""
+    """Pushes radio state to WaveLog via the REST API v2 (POST /api/v2/radio)."""
 
-    def __init__(self, port: int) -> None:
-        self.port = port
-        self._clients: Set[WebSocketServerProtocol] = set()
+    def __init__(self, url: str, api_key: str, radio_name: str) -> None:
+        self._endpoint = url.rstrip("/") + "/index.php/api/v2/radio"
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        self._radio_name = radio_name
+        self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
-        """Start the WebSocket server (runs forever)."""
-        logging.info(f"[WaveLog] Starting WebSocket server on ws://localhost:{self.port}")
-        async with websockets.serve(self._handle_client, "localhost", self.port):
-            await asyncio.Future()  # run forever
+        """Open the shared HTTP session. Called once at startup."""
+        self._session = aiohttp.ClientSession(headers=self._headers)
+        logging.info(f"[WaveLog] REST client ready → {self._endpoint}")
 
-    async def _handle_client(self, websocket: WebSocketServerProtocol) -> None:
-        """Handle a new client connection."""
-        self._clients.add(websocket)
-        logging.info("[WaveLog] Browser connected")
-        try:
-            await websocket.send(json.dumps({
-                "type": "welcome",
-                "message": "Connected to Python CAT bridge"
-            }))
-            await websocket.wait_closed()
-        finally:
-            self._clients.remove(websocket)
-            logging.info("[WaveLog] Browser disconnected")
+    async def close(self) -> None:
+        if self._session:
+            await self._session.close()
+            self._session = None
 
     async def broadcast_status(self, frequency: int, mode: str) -> None:
-        """Send current radio status to all connected clients."""
-        if not self._clients:
+        """Push current radio state to WaveLog."""
+        if not self._session:
+            logging.warning("[WaveLog] Session not started, skipping broadcast")
             return
 
-        message = {
-            "type": "radio_status",
-            "radio": True,
+        payload = {
+            "radio": self._radio_name,
             "frequency": int(frequency),
-            "mode": mode,
-            "power": 0,
-            "split": False,
-            "vfoB": None,
-            "modeB": None,
-            "timestamp": int(time.time() * 1000)
+            "mode": mode or None,
         }
 
-        dead = set()
-        for ws in self._clients:
-            try:
-                await ws.send(json.dumps(message))
-            except Exception:
-                dead.add(ws)
-
-        self._clients.difference_update(dead)
-        logging.info(f"[WaveLog] Broadcast: {message}")
+        try:
+            async with self._session.post(self._endpoint, json=payload) as resp:
+                if resp.status in (200, 201):
+                    logging.info(f"[WaveLog] Pushed: freq={frequency} mode={mode} ({resp.status})")
+                else:
+                    body = await resp.text()
+                    logging.warning(f"[WaveLog] Push failed {resp.status}: {body}")
+        except Exception as e:
+            logging.warning(f"[WaveLog] Request error: {e}")
