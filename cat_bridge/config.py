@@ -14,10 +14,11 @@ class Settings:
     # SDRConnect WebSocket URL
     SDR_WS_URL: str = "ws://127.0.0.1:5454/"
 
-    # WaveLog REST API v2
-    WAVELOG_URL: str = "192.168.1.27:8086"
-    WAVELOG_API_KEY: str = "wl2_your_token_here"
-    WAVELOG_RADIO_NAME: str = "HB9HIH"
+    # WaveLog API v2 (token needs scope radio:write)
+    WAVELOG_URL: str = "https://log.hb9hih.com"
+    WAVELOG_TOKEN: str = ""
+    WAVELOG_RADIO_NAME: str = "SDRConnect"
+    WAVELOG_MIN_INTERVAL: float = 0.5  # seconds between pushes
 
     # Polling intervals
     POLL_INTERVAL: float = 0.1  # seconds
